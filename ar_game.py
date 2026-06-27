@@ -6,7 +6,7 @@ import time
 # Initialize MediaPipe Face Mesh and Pose
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,
+    max_num_faces=5,  # Increased from 1 to 5 to support multiple people
     refine_landmarks=True,
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
@@ -26,8 +26,15 @@ sun_img = cv2.imread('assets/sun.png', cv2.IMREAD_UNCHANGED)
 cloud_img = cv2.imread('assets/cloud.png', cv2.IMREAD_UNCHANGED)
 lightning_img = cv2.imread('assets/lightning.png', cv2.IMREAD_UNCHANGED)
 
-current_character = "Jett (乐迪)"
-mask_img = jett_mask
+# Global character state for each side
+left_character = "Dizzy"
+right_character = "Jett"
+
+def get_mask_for_character(char_name):
+    if char_name == "Jett":
+        return jett_mask
+    else:
+        return dizzy_mask
 
 def overlay_transparent(background, overlay, x, y):
     """Overlays a transparent PNG onto a background image at (x,y)."""
@@ -123,10 +130,16 @@ while cap.isOpened():
 
     current_state = "Neutral"
 
-    # 1. Determine Expression / Gesture
+    # 1. Determine Global Weather Effects (If ANYONE triggers it)
+    global_storm = False
+    
+    # We can only track one main pose with standard mp.solutions.pose (without holistic or newer multi-pose).
+    # However, MediaPipe pose usually tracks the most prominent person. 
     if is_shielding_rain(results_pose.pose_landmarks):
+        global_storm = True
         current_state = "Shielding (Storm)"
         
+    if global_storm:
         # Apply Lightning (Flashes randomly)
         lightning_timer += 1
         if lightning_timer > np.random.randint(10, 30):
@@ -140,7 +153,7 @@ while cap.isOpened():
         # Apply Rain Effect
         if rain_img is not None:
             rain_resized = cv2.resize(rain_img, (w, h))
-            rain_offset_y = (rain_offset_y + 20) % h # Faster rain
+            rain_offset_y = (rain_offset_y + 20) % h
             rain_top = rain_resized[h-rain_offset_y:, :]
             rain_bottom = rain_resized[:h-rain_offset_y, :]
             image = overlay_transparent(image, rain_top, 0, 0)
@@ -151,18 +164,34 @@ while cap.isOpened():
             cloud_resized = cv2.resize(cloud_img, (w, int(h * 0.4)))
             image = overlay_transparent(image, cloud_resized, 0, 0)
 
+    # 2. Process all detected faces (Multi-player support)
+    anyone_smiling = False
+    
     if results_face.multi_face_landmarks:
-        for face_landmarks in results_face.multi_face_landmarks:
+        # Draw a subtle center line to show the split
+        cv2.line(image, (w//2, 0), (w//2, h), (255, 255, 255), 1, cv2.LINE_AA)
+        
+        for face_idx, face_landmarks in enumerate(results_face.multi_face_landmarks):
             landmarks = face_landmarks.landmark
             
-            # Check smiling (only if not already raining)
-            if current_state == "Neutral" and is_smiling(landmarks, w, h):
-                current_state = "Smiling (Sun)"
-                if sun_img is not None:
-                    sun_resized = cv2.resize(sun_img, (w, h))
-                    image = overlay_transparent(image, sun_resized, 0, 0)
-
-            # 2. Apply Mask
+            # Check smiling (only if not already raining globally)
+            if not global_storm and is_smiling(landmarks, w, h):
+                anyone_smiling = True
+                
+            # Determine which side of the screen the face is on
+            # We use the nose tip (landmark 1) x-coordinate
+            nose_x = int(landmarks[1].x * w)
+            
+            if nose_x < w // 2:
+                # Face is on the Left side
+                char_name = left_character
+                mask_img = get_mask_for_character(left_character)
+            else:
+                # Face is on the Right side
+                char_name = right_character
+                mask_img = get_mask_for_character(right_character)
+                
+            # Apply Mask to EVERY detected face
             if mask_img is not None:
                 x_coords = [lm.x * w for lm in landmarks]
                 y_coords = [lm.y * h for lm in landmarks]
@@ -176,22 +205,31 @@ while cap.isOpened():
                 mask_w = int(face_w * 1.5)
                 mask_h = int(mask_img.shape[0] * (mask_w / mask_img.shape[1]))
                 
-                mask_resized = cv2.resize(mask_img, (mask_w, mask_h))
-                
-                pos_x = int(landmarks[1].x * w) - mask_w // 2 
-                pos_y = top_head[1] - mask_h // 2 
-                
-                image = overlay_transparent(image, mask_resized, pos_x, pos_y)
+                # Prevent crash if face is too close/large
+                if mask_w > 0 and mask_h > 0:
+                    mask_resized = cv2.resize(mask_img, (mask_w, mask_h))
+                    
+                    pos_x = int(landmarks[1].x * w) - mask_w // 2 
+                    pos_y = top_head[1] - mask_h // 2 
+                    
+                    image = overlay_transparent(image, mask_resized, pos_x, pos_y)
+                    
+    # Apply Sun effect if ANYONE is smiling and there is no storm
+    if anyone_smiling and not global_storm:
+        current_state = "Smiling (Sun)"
+        if sun_img is not None:
+            sun_resized = cv2.resize(sun_img, (w, h))
+            image = overlay_transparent(image, sun_resized, 0, 0)
 
     cv2.putText(image, f"Expression: {current_state}", (20, 40), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
     
-    cv2.putText(image, f"Character: {current_character}", (20, 80), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 100, 100), 2, cv2.LINE_AA)
+    cv2.putText(image, f"L: {left_character} | R: {right_character}", (20, 80), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 100), 2, cv2.LINE_AA)
     
-    cv2.putText(image, "Press 'SPACE' to switch character", (20, h - 50), 
+    cv2.putText(image, "SPACE: Swap Both | A: Swap Left | D: Swap Right", (20, h - 50), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(image, "Press 'Q' to quit", (20, h - 20), 
+    cv2.putText(image, "Q: Quit", (20, h - 20), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
     cv2.imshow('Super Wings AR Game', image)
@@ -200,12 +238,14 @@ while cap.isOpened():
     if key == ord('q'):
         break
     elif key == ord(' '):
-        if current_character == "Jett (乐迪)":
-            current_character = "Dizzy (小爱)"
-            mask_img = dizzy_mask
-        else:
-            current_character = "Jett (乐迪)"
-            mask_img = jett_mask
+        # Swap both
+        left_character, right_character = right_character, left_character
+    elif key == ord('a'):
+        # Swap left only
+        left_character = "Jett" if left_character == "Dizzy" else "Dizzy"
+    elif key == ord('d'):
+        # Swap right only
+        right_character = "Jett" if right_character == "Dizzy" else "Dizzy"
 
 cap.release()
 cv2.destroyAllWindows()
