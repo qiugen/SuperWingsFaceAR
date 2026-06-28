@@ -47,6 +47,13 @@ bullets = []
 grenades = []
 hit_effects = []
 explosions = []
+gesture_cooldowns = {
+    "left_bullet": 0,
+    "right_bullet": 0,
+    "left_grenade": 0,
+    "right_grenade": 0,
+}
+gesture_messages = []
 
 
 def overlay_transparent(background, overlay, x, y):
@@ -114,27 +121,47 @@ def face_is_smiling(gray, face):
     return len(smiles) > 0
 
 
-def detect_shielding_motion(gray, faces):
-    """简单实用版“挡雨手势”：脸上方出现明显运动，就认为抬手挡雨。"""
+def get_motion_mask(gray):
+    """基于前后帧差分生成动作区域，用于体感控制。"""
     global prev_gray
-    if prev_gray is None or not faces:
+    if prev_gray is None:
         prev_gray = gray.copy()
-        return False
+        return np.zeros_like(gray)
 
     diff = cv2.absdiff(prev_gray, gray)
-    _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+    _, motion_mask = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+    motion_mask = cv2.medianBlur(motion_mask, 5)
+    motion_mask = cv2.dilate(motion_mask, None, iterations=2)
     prev_gray = gray.copy()
+    return motion_mask
+
+
+def motion_ratio(motion_mask, left, top, right, bottom):
+    """计算某个区域里的动作占比。"""
+    h, w = motion_mask.shape[:2]
+    left = max(0, min(w, int(left)))
+    right = max(0, min(w, int(right)))
+    top = max(0, min(h, int(top)))
+    bottom = max(0, min(h, int(bottom)))
+    if right <= left or bottom <= top:
+        return 0
+    roi = motion_mask[top:bottom, left:right]
+    if roi.size == 0:
+        return 0
+    return cv2.countNonZero(roi) / roi.size
+
+
+def detect_shielding_motion(motion_mask, faces):
+    """简单实用版“挡雨手势”：脸上方出现明显运动，就认为抬手挡雨。"""
+    if not faces:
+        return False
 
     for x, y, fw, fh in faces:
-        top = max(0, y - int(fh * 0.9))
-        bottom = max(0, y + int(fh * 0.25))
-        left = max(0, x - int(fw * 0.5))
-        right = min(gray.shape[1], x + int(fw * 1.5))
-        roi = thresh[top:bottom, left:right]
-        if roi.size == 0:
-            continue
-        moving_pixels = cv2.countNonZero(roi)
-        if moving_pixels / roi.size > 0.08:
+        top = y - int(fh * 0.9)
+        bottom = y + int(fh * 0.25)
+        left = x - int(fw * 0.5)
+        right = x + int(fw * 1.5)
+        if motion_ratio(motion_mask, left, top, right, bottom) > 0.08:
             return True
     return False
 
@@ -235,6 +262,88 @@ def throw_grenade_from_faces(side, faces):
                     "angle": 0,
                 }
             )
+
+
+def add_gesture_message(text, x, y, color):
+    gesture_messages.append({"text": text, "x": int(x), "y": int(y), "timer": 28, "color": color})
+
+
+def draw_gesture_guides(image, face, side):
+    """画出简单体感识别区域，方便站位：脸两侧挥拳/握拳，下半身抬腿。"""
+    x, y, fw, fh = face
+    h, w = image.shape[:2]
+    hand_top = y + int(fh * 0.15)
+    hand_bottom = y + int(fh * 1.65)
+    left_hand = (x - int(fw * 1.15), hand_top, x - int(fw * 0.08), hand_bottom)
+    right_hand = (x + int(fw * 1.08), hand_top, x + int(fw * 2.15), hand_bottom)
+    leg_box = (x - int(fw * 0.85), y + int(fh * 1.65), x + int(fw * 1.85), min(h, y + int(fh * 4.4)))
+
+    for box, color in [(left_hand, (255, 220, 0)), (right_hand, (255, 220, 0)), (leg_box, (0, 180, 255))]:
+        l, t, r, b = box
+        l, r = max(0, l), min(w, r)
+        t, b = max(0, t), min(h, b)
+        if r > l and b > t:
+            cv2.rectangle(image, (l, t), (r, b), color, 1, cv2.LINE_AA)
+
+    return image
+
+
+def process_body_gestures(image, motion_mask, left_faces, right_faces):
+    """体感控制：双手握拳/出拳发射子弹；腿部动作投掷手雷。"""
+    now = time.time()
+    h, w = image.shape[:2]
+
+    for side, faces in [("left", left_faces), ("right", right_faces)]:
+        for face in faces:
+            x, y, fw, fh = face
+            image = draw_gesture_guides(image, face, side)
+
+            hand_top = y + int(fh * 0.15)
+            hand_bottom = y + int(fh * 1.65)
+            left_hand_ratio = motion_ratio(
+                motion_mask,
+                x - fw * 1.15,
+                hand_top,
+                x - fw * 0.08,
+                hand_bottom,
+            )
+            right_hand_ratio = motion_ratio(
+                motion_mask,
+                x + fw * 1.08,
+                hand_top,
+                x + fw * 2.15,
+                hand_bottom,
+            )
+
+            # 双手握拳/向前打拳：脸两侧手部区域同时出现动作，就自动发射子弹。
+            bullet_key = f"{side}_bullet"
+            if left_hand_ratio > 0.035 and right_hand_ratio > 0.035 and now > gesture_cooldowns[bullet_key]:
+                shoot_from_faces(side, [face])
+                gesture_cooldowns[bullet_key] = now + 0.9
+                add_gesture_message(f"{side.upper()} FIST BULLET!", x, max(28, y - 32), (0, 255, 255))
+
+            leg_ratio = motion_ratio(
+                motion_mask,
+                x - fw * 0.85,
+                y + fh * 1.65,
+                x + fw * 1.85,
+                y + fh * 4.4,
+            )
+
+            # 如果摄像头只拍到上半身，下半身区域很小，则额外用本侧屏幕下半部分作为腿部动作兜底。
+            if leg_ratio < 0.01:
+                if side == "left":
+                    leg_ratio = motion_ratio(motion_mask, 0, h * 0.55, w * 0.5, h)
+                else:
+                    leg_ratio = motion_ratio(motion_mask, w * 0.5, h * 0.55, w, h)
+
+            grenade_key = f"{side}_grenade"
+            if leg_ratio > 0.055 and now > gesture_cooldowns[grenade_key]:
+                throw_grenade_from_faces(side, [face])
+                gesture_cooldowns[grenade_key] = now + 1.5
+                add_gesture_message(f"{side.upper()} LEG GRENADE!", x, y + fh + 28, (0, 180, 255))
+
+    return image
 
 
 def add_explosion(x, y, side, left_faces, right_faces):
@@ -408,11 +517,30 @@ def process_bullets(image, left_faces, right_faces):
     return image
 
 
+def draw_gesture_messages(image):
+    for msg in gesture_messages[:]:
+        cv2.putText(
+            image,
+            msg["text"],
+            (msg["x"], msg["y"]),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            msg["color"],
+            2,
+            cv2.LINE_AA,
+        )
+        msg["timer"] -= 1
+        if msg["timer"] <= 0:
+            gesture_messages.remove(msg)
+    return image
+
+
 def draw_ui(image, state, left_faces, right_faces):
     h, w = image.shape[:2]
     cv2.line(image, (w // 2, 0), (w // 2, h), (255, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(image, f"State: {state}", (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     cv2.putText(image, f"L:{left_character} ({len(left_faces)})  R:{right_character} ({len(right_faces)})", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 200, 100), 2)
+    cv2.putText(image, "Body: both fists = gun | leg/kick = grenade", (20, h - 104), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
     cv2.putText(image, "A:Left role | Enter:Right role | Space:Swap | R:Storm | S:Sun", (20, h - 76), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
     cv2.putText(image, "Z:Left gun | M:Right gun | X:Left grenade | N:Right grenade", (20, h - 48), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
     cv2.putText(image, "Q:Quit", (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
@@ -437,6 +565,7 @@ def main():
 
         image = cv2.flip(image, 1)
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        motion_mask = get_motion_mask(gray)
         faces = detect_faces(gray)
 
         h, w = image.shape[:2]
@@ -445,7 +574,7 @@ def main():
 
         now = time.time()
         smiling = any(face_is_smiling(gray, tuple(face)) for face in faces)
-        shielding = detect_shielding_motion(gray, [tuple(face) for face in faces])
+        shielding = detect_shielding_motion(motion_mask, [tuple(face) for face in faces])
 
         state = "Neutral"
         if shielding or now < storm_manual_until:
@@ -462,9 +591,11 @@ def main():
             image = draw_player(image, face, "right", right_character)
 
         image = draw_guns(image, left_faces, right_faces)
+        image = process_body_gestures(image, motion_mask, left_faces, right_faces)
         image = process_grenades(image, left_faces, right_faces)
         image = process_bullets(image, left_faces, right_faces)
         image = process_explosions(image)
+        image = draw_gesture_messages(image)
         image = draw_ui(image, state, left_faces, right_faces)
 
         cv2.imshow("Super Wings AR Game", image)
